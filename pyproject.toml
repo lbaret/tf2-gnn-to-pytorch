@@ -5,6 +5,10 @@ description = "Convert tf2-gnn from TensorFlow to PyTorch framework"
 authors = ["Loïc <baret.loic.1@gmail.com>"]
 license = "MIT Licence"
 readme = "README.md"
+packages = [
+    { include = "pytorch_gnn"},
+    { include = "tf2_gnn" }
+]
 
 [tool.poetry.dependencies]
 python = "^3.9"

@@ -27,7 +27,7 @@ def get_activation_function_by_name(
     return activation_fn
 
 # TODO: Test this function and compare results with TF version
-def unsorted_segment_softmax(logits: torch.Tensor, segment_ids: torch.Tensor, num_segments: int) -> torch.Tensor:
+def unsorted_segment_softmax(logits: torch.Tensor, segment_ids: torch.Tensor, num_segments: int=1) -> torch.Tensor:
     """Perform a safe unsorted segment softmax."""
     max_per_segment = segment_coo(
         logits, segment_ids, reduce="max"

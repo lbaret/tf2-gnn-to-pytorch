@@ -7,10 +7,9 @@ import torch
 import torch.nn as nn
 from dpu_utils.tf2utils import (
     MLP,
-    unsorted_segment_softmax,
 )
 
-from ..utils import get_activation_function_by_name
+from ..utils import get_activation_function_by_name, unsorted_segment_softmax
 
 
 class NodesToGraphRepresentationInput(NamedTuple):
