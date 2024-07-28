@@ -3,19 +3,26 @@ from abc import abstractmethod
 from typing import List, NamedTuple, Optional
 
 import tensorflow as tf
-from dpu_utils.tf2utils import MLP, get_activation_function_by_name, unsorted_segment_softmax
+import torch
+import torch.nn as nn
+from dpu_utils.tf2utils import (
+    MLP,
+    unsorted_segment_softmax,
+)
+
+from ..utils import get_activation_function_by_name
 
 
 class NodesToGraphRepresentationInput(NamedTuple):
     """A named tuple to hold input to layers computing graph representations from nodes
     representations."""
 
-    node_embeddings: tf.Tensor
-    node_to_graph_map: tf.Tensor
-    num_graphs: tf.Tensor
+    node_embeddings: torch.Tensor
+    node_to_graph_map: torch.Tensor
+    num_graphs: torch.Tensor
 
 
-class NodesToGraphRepresentation(tf.keras.layers.Layer):
+class NodesToGraphRepresentation(nn.Module):
     """Abstract class to compute graph representations from node representations.
 
     Throughout we use the following abbreviations in shape descriptions:
@@ -167,7 +174,7 @@ class WeightedSumGraphRepresentation(NodesToGraphRepresentation):
             tf.TensorSpec(shape=(), dtype=tf.bool),
         )
     )
-    def call(self, inputs: NodesToGraphRepresentationInput, training: bool = False):
+    def call(self, inputs: NodesToGraphRepresentationInput, training: bool = False): # NOTE: https://www.tensorflow.org/api_docs/python/tf/keras/Layer => build (in TF) + forward (PyTorch equivalent)
         # (1) compute weights for each node/head pair:
         if self._weighting_fun not in ("none", "average"):
             scores = self._scoring_mlp(inputs.node_embeddings, training=training)  # Shape [V, H]

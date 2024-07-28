@@ -11,7 +11,11 @@ python = "^3.9"
 tensorflow = "^2.17.0"
 torch = "^2.4.0"
 ipykernel = "^6.29.5"
+dpu-utils = "^0.6.1"
+poethepoet = "^0.27.0"
 
+[tool.poe.tasks]
+install-torch-scatter = "python -m pip install torch-scatter -f https://data.pyg.org/whl/torch-2.4.0+cu12.html"
 
 [build-system]
 requires = ["poetry-core"]
