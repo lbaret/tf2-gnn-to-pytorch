@@ -89,4 +89,8 @@ class MLP(nn.Module):
         )
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        return self._layers(input)
+        y = input
+        for layer in self._layers:
+            y = layer(y)
+        
+        return y
