@@ -2,13 +2,12 @@
 from abc import abstractmethod
 from typing import List, NamedTuple, Optional
 
-import tensorflow as tf
 import torch
 import torch.nn as nn
-from dpu_utils.tf2utils import (
-    MLP,
-)
+import torch.nn.functional as F
+from torch_scatter import segment_coo
 
+from ..models.mlp import MLP
 from ..utils import get_activation_function_by_name, unsorted_segment_softmax
 
 
@@ -36,7 +35,7 @@ class NodesToGraphRepresentation(nn.Module):
         self._graph_representation_size = graph_representation_size
 
     @abstractmethod
-    def call(self, inputs: NodesToGraphRepresentationInput, training: bool = False):
+    def forward(self, inputs: NodesToGraphRepresentationInput, training: bool = False):
         """Call the layer.
 
         Args:
@@ -71,6 +70,7 @@ class WeightedSumGraphRepresentation(NodesToGraphRepresentation):
 
     def __init__(
         self,
+        mlp_input_size: int,
         graph_representation_size: int,
         num_heads: int,
         weighting_fun: str = "softmax",  # One of {"softmax", "sigmoid"}
@@ -85,9 +85,10 @@ class WeightedSumGraphRepresentation(NodesToGraphRepresentation):
         transformation_mlp_result_lower_bound: Optional[float] = None,
         transformation_mlp_result_upper_bound: Optional[float] = None,
         **kwargs,
-    ):
+    ) -> None:
         """
         Args:
+            mlp_input_size: Size of input features dimension.
             graph_representation_size: Size of the computed graph representation.
             num_heads: Number of independent heads to use to compute weights.
             weighting_fun: "sigmoid" ([0, 1] weights for each node computed from its
@@ -134,6 +135,7 @@ class WeightedSumGraphRepresentation(NodesToGraphRepresentation):
         # Build sub-layers:
         if self._weighting_fun not in ("none", "average"):
             self._scoring_mlp = MLP(
+                in_size=mlp_input_size,
                 out_size=self._num_heads,
                 hidden_layers=scoring_mlp_layers,
                 use_biases=scoring_mlp_use_biases,
@@ -145,6 +147,7 @@ class WeightedSumGraphRepresentation(NodesToGraphRepresentation):
             )
 
         self._transformation_mlp = MLP(
+            in_size=mlp_input_size,
             out_size=self._graph_representation_size,
             hidden_layers=transformation_mlp_layers,
             use_biases=transformation_mlp_use_biases,
@@ -152,33 +155,13 @@ class WeightedSumGraphRepresentation(NodesToGraphRepresentation):
             dropout_rate=transformation_mlp_dropout_rate,
             name="TransformationMLP",
         )
-
-    def build(self, input_shapes: NodesToGraphRepresentationInput):
-        with tf.name_scope("WeightedSumGraphRepresentation"):
-            if self._weighting_fun not in ("none", "average"):
-                self._scoring_mlp.build(
-                    tf.TensorShape((None, input_shapes.node_embeddings[-1]))
-                )
-            self._transformation_mlp.build(tf.TensorShape((None, input_shapes.node_embeddings[-1])))
-
-            super().build(input_shapes)
-
-    @tf.function(
-        input_signature=(
-            NodesToGraphRepresentationInput(
-                node_embeddings=tf.TensorSpec(shape=tf.TensorShape((None, None)), dtype=tf.float32),
-                node_to_graph_map=tf.TensorSpec(shape=tf.TensorShape((None,)), dtype=tf.int32),
-                num_graphs=tf.TensorSpec(shape=(), dtype=tf.int32),
-            ),
-            tf.TensorSpec(shape=(), dtype=tf.bool),
-        )
-    )
-    def call(self, inputs: NodesToGraphRepresentationInput, training: bool = False): # NOTE: https://www.tensorflow.org/api_docs/python/tf/keras/Layer => build (in TF) + forward (PyTorch equivalent)
+        
+    def forward(self, inputs: NodesToGraphRepresentationInput) -> torch.Tensor: # NOTE: https://www.tensorflow.org/api_docs/python/tf/keras/Layer => build (in TF) + forward (PyTorch equivalent)
         # (1) compute weights for each node/head pair:
         if self._weighting_fun not in ("none", "average"):
-            scores = self._scoring_mlp(inputs.node_embeddings, training=training)  # Shape [V, H]
+            scores = self._scoring_mlp(inputs.node_embeddings)  # Shape [V, H]
             if self._weighting_fun == "sigmoid":
-                weights = tf.nn.sigmoid(scores)  # Shape [V, H]
+                weights = F.sigmoid(scores)  # Shape [V, H]
             elif self._weighting_fun == "softmax":
                 weights_per_head = []
                 for head_idx in range(self._num_heads):
@@ -188,49 +171,48 @@ class WeightedSumGraphRepresentation(NodesToGraphRepresentation):
                         segment_ids=inputs.node_to_graph_map,
                         num_segments=inputs.num_graphs,
                     )  # Shape [V]
-                    weights_per_head.append(tf.expand_dims(head_weights, -1))
-                weights = tf.concat(weights_per_head, axis=1)  # Shape [V, H]
+                    weights_per_head.append(head_weights.unsqueeze(-1))
+                weights = torch.concat(weights_per_head, dim=1)  # Shape [V, H]
             else:
                 raise ValueError()
 
         # (2) compute representations for each node/head pair:
         node_reprs = self._transformation_mlp_activation_fun(
-            self._transformation_mlp(inputs.node_embeddings, training=training)
+            self._transformation_mlp(inputs.node_embeddings)
         )  # Shape [V, GD]
         if self._transformation_mlp_result_lower_bound is not None:
-            node_reprs = tf.maximum(node_reprs, self._transformation_mlp_result_lower_bound)
+            node_reprs = torch.maximum(node_reprs, self._transformation_mlp_result_lower_bound)
         if self._transformation_mlp_result_upper_bound is not None:
-            node_reprs = tf.minimum(node_reprs, self._transformation_mlp_result_upper_bound)
-        node_reprs = tf.reshape(
-            node_reprs,
+            node_reprs = torch.minimum(node_reprs, self._transformation_mlp_result_upper_bound)
+        node_reprs = node_reprs.reshape(
             shape=(-1, self._num_heads, self._graph_representation_size // self._num_heads),
         )  # Shape [V, H, GD//H]
 
         # (3) if necessary, weight representations and aggregate by graph:
         if self._weighting_fun == "none":
-            node_reprs = tf.reshape(
-                node_reprs, shape=(-1, self._graph_representation_size)
+            node_reprs = node_reprs.reshape(
+                shape=(-1, self._graph_representation_size)
             )  # Shape [V, GD]
-            graph_reprs = tf.math.segment_sum(
-                data=node_reprs, segment_ids=inputs.node_to_graph_map
-            )  # Shape [G, GD]
+            graph_reprs = segment_coo(
+                src=node_reprs, index=inputs.node_to_graph_map, reduce="sum"
+            ) # Shape [G, GD]
         elif self._weighting_fun == "average":
-            node_reprs = tf.reshape(
-                node_reprs, shape=(-1, self._graph_representation_size)
+            node_reprs = node_reprs.reshape(
+                shape=(-1, self._graph_representation_size)
             )  # Shape [V, GD]
-            graph_reprs = tf.math.segment_mean(
-                data=node_reprs, segment_ids=inputs.node_to_graph_map
+            graph_reprs = segment_coo(
+                src=node_reprs, index=inputs.node_to_graph_map, reduce="mean"
             )  # Shape [G, GD]
         else:
-            weights = tf.expand_dims(weights, -1)  # Shape [V, H, 1]
+            weights = weights.unsqueeze(-1)  # Shape [V, H, 1]
             weighted_node_reprs = weights * node_reprs  # Shape [V, H, GD//H]
 
-            weighted_node_reprs = tf.reshape(
-                weighted_node_reprs, shape=(-1, self._graph_representation_size)
+            weighted_node_reprs = weighted_node_reprs.reshape(
+                shape=(-1, self._graph_representation_size)
             )  # Shape [V, GD]
-            graph_reprs = tf.math.segment_sum(
-                data=weighted_node_reprs, segment_ids=inputs.node_to_graph_map
-            )  # Shape [G, GD]
+            graph_reprs = segment_coo(
+                src=weighted_node_reprs, index=inputs.node_to_graph_map, reduce="sum"
+            ) # Shape [G, GD]
 
         return graph_reprs
 
@@ -241,6 +223,7 @@ class WASGraphRepresentation(NodesToGraphRepresentation):
 
     def __init__(
         self,
+        mlp_input_size: int,
         graph_representation_size: int = 128,
         num_heads: int = 8,
         pooling_mlp_layers: List[int] = [128, 128],
@@ -248,10 +231,11 @@ class WASGraphRepresentation(NodesToGraphRepresentation):
         pooling_mlp_use_biases: bool = True,
         pooling_mlp_dropout_rate: float = 0.0,
         **kwargs,
-    ):
+    ) -> None:
         super().__init__(graph_representation_size, **kwargs)
 
         self.__weighted_avg_graph_repr_layer = WeightedSumGraphRepresentation(
+            mlp_input_size=mlp_input_size,
             graph_representation_size=graph_representation_size,
             num_heads=num_heads,
             weighting_fun="softmax",
@@ -266,6 +250,7 @@ class WASGraphRepresentation(NodesToGraphRepresentation):
         )
 
         self.__weighted_sum_graph_repr_layer = WeightedSumGraphRepresentation(
+            mlp_input_size=mlp_input_size,
             graph_representation_size=graph_representation_size,
             num_heads=num_heads,
             weighting_fun="sigmoid",
@@ -279,42 +264,14 @@ class WASGraphRepresentation(NodesToGraphRepresentation):
             transformation_mlp_activation_fun=pooling_mlp_activation_fun,
         )
 
-        self.__out_projection = tf.keras.layers.Dense(
-            units=graph_representation_size, use_bias=False, activation=None,
+        self.__out_projection = torch.Linear(
+            in_features=2*self._graph_representation_size, out_features=graph_representation_size, bias=False,
         )
 
-    def build(self, input_shapes: NodesToGraphRepresentationInput):
-        with tf.name_scope(self.__class__.__name__):
-            with tf.name_scope("WeightedAvgGraphRepresentation"):
-                self.__weighted_avg_graph_repr_layer.build(input_shapes)
-
-            with tf.name_scope("WeightedSumGraphRepresentation"):
-                self.__weighted_sum_graph_repr_layer.build(input_shapes)
-
-            self.__out_projection.build(
-                tf.TensorShape((None, 2 * self._graph_representation_size))
-            )
-
-            super().build(input_shapes)
-
-    @tf.function(
-        input_signature=(
-            NodesToGraphRepresentationInput(
-                node_embeddings=tf.TensorSpec(
-                    shape=tf.TensorShape((None, None)), dtype=tf.float32
-                ),
-                node_to_graph_map=tf.TensorSpec(
-                    shape=tf.TensorShape((None,)), dtype=tf.int32
-                ),
-                num_graphs=tf.TensorSpec(shape=(), dtype=tf.int32),
-            ),
-            tf.TensorSpec(shape=(), dtype=tf.bool),
-        )
-    )
-    def call(self, inputs: NodesToGraphRepresentationInput, training: bool = False):
-        avg_graph_repr = self.__weighted_avg_graph_repr_layer(inputs, training)
-        sum_graph_repr = self.__weighted_sum_graph_repr_layer(inputs, training)
+    def forward(self, inputs: NodesToGraphRepresentationInput) -> torch.Tensor:
+        avg_graph_repr = self.__weighted_avg_graph_repr_layer(inputs)
+        sum_graph_repr = self.__weighted_sum_graph_repr_layer(inputs)
 
         return self.__out_projection(
-            tf.concat([avg_graph_repr, sum_graph_repr], axis=-1), training=training
+            torch.concat([avg_graph_repr, sum_graph_repr], dim=-1)
         )
